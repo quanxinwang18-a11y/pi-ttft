@@ -30,21 +30,94 @@
  *            means the prompt cache missed)
  *   tok/s    decode speed = output tokens / (message_end - first token)
  *
+ * Configuration (see README):
+ *
+ *   // ~/.pi/agent/settings.json, or .pi/settings.json in a project
+ *   {
+ *     "ttft": {
+ *       "slowMs": 5000,
+ *       "slowTps": 20,
+ *       "dominantRatio": 2
+ *     }
+ *   }
+ *
+ * Project settings override global ones key by key. Invalid values fall back to
+ * the default. Config is read on session start and by `/ttft reload`.
+ *
  * Commands:
- *   /ttft          full breakdown
+ *   /ttft          full breakdown plus effective config
+ *   /ttft reload   re-read settings without restarting
  *   /ttft reset    reset counters
  */
 
+import { CONFIG_DIR_NAME, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const STATUS_KEY = "ttft";
 
-/** TTFT at or above this is treated as slow: expand the breakdown. */
-const TTFT_SLOW_MS = 3000;
-/** Decode speed below this is treated as slow: add a marker. */
-const TPS_SLOW = 20;
-/** How dominant one side must be before we name a culprit. */
-const DOMINANT_RATIO = 2;
+interface TtftConfig {
+	/** TTFT at or above this (ms) is treated as slow: expand the breakdown. */
+	slowMs: number;
+	/** Decode speed below this (tok/s) is treated as slow: add a marker. */
+	slowTps: number;
+	/** How dominant one side must be (×) before a culprit is named. */
+	dominantRatio: number;
+}
+
+const DEFAULT_CONFIG: TtftConfig = {
+	slowMs: 3000,
+	slowTps: 20,
+	dominantRatio: 2,
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+	typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isPositive = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value > 0;
+
+/** Read `ttft` from global settings, then project settings (project wins per key). */
+function readConfig(ctx: ExtensionContext): { config: TtftConfig; notes: string[] } {
+	const config = { ...DEFAULT_CONFIG };
+	const notes: string[] = [];
+
+	let scopes: Array<[string, unknown]>;
+	try {
+		const manager = SettingsManager.create(ctx.cwd, getAgentDir());
+		scopes = [
+			["global", manager.getGlobalSettings()],
+			["project", manager.getProjectSettings()],
+		];
+	} catch {
+		return { config, notes: ["could not read settings, using defaults"] };
+	}
+
+	for (const [scope, settings] of scopes) {
+		if (!isRecord(settings)) continue;
+		const raw = settings.ttft;
+		if (!isRecord(raw)) continue;
+
+		const applied: string[] = [];
+		if (isPositive(raw.slowMs)) {
+			config.slowMs = raw.slowMs;
+			applied.push(`slowMs=${raw.slowMs}`);
+		}
+		if (isPositive(raw.slowTps)) {
+			config.slowTps = raw.slowTps;
+			applied.push(`slowTps=${raw.slowTps}`);
+		}
+		// A ratio below 1 would flag every turn, so require at least 1.
+		if (isPositive(raw.dominantRatio) && raw.dominantRatio >= 1) {
+			config.dominantRatio = raw.dominantRatio;
+			applied.push(`dominantRatio=${raw.dominantRatio}`);
+		}
+		if (applied.length > 0) notes.push(`${scope}: ${applied.join(", ")}`);
+	}
+
+	return { config, notes };
+}
+
+const configPath = (scope: "global" | "project", cwd: string): string =>
+	scope === "global" ? `${getAgentDir()}/settings.json` : `${cwd}/${CONFIG_DIR_NAME}/settings.json`;
 
 export default function (pi: ExtensionAPI) {
 	// ---- current request (reset by before_provider_request) ----
@@ -68,13 +141,16 @@ export default function (pi: ExtensionAPI) {
 	// Concurrent tool timers, summed as a union of intervals
 	const runningTools = new Map<string, number>();
 
-	const fmt = (ms: number): string =>
-		ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
+	// ---- effective configuration ----
+	let config: TtftConfig = { ...DEFAULT_CONFIG };
+	let configNotes: string[] = ["defaults"];
+
+	const fmt = (ms: number): string => (ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`);
 
 	/** Name a culprit when one side clearly dominates; stay silent otherwise. */
 	function verdict(respMs: number, prefillMs: number): string {
-		if (respMs >= prefillMs * DOMINANT_RATIO) return " ⚠network";
-		if (prefillMs >= respMs * DOMINANT_RATIO) return " ⚠server";
+		if (respMs >= prefillMs * config.dominantRatio) return " ⚠network";
+		if (prefillMs >= respMs * config.dominantRatio) return " ⚠server";
 		return "";
 	}
 
@@ -89,7 +165,7 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				const ttftMs = firstEventAt - reqAt;
 				parts.push(`TTFT ${fmt(ttftMs)}`);
-				if (respAt !== undefined && ttftMs >= TTFT_SLOW_MS) {
+				if (respAt !== undefined && ttftMs >= config.slowMs) {
 					const respMs = respAt - reqAt;
 					const prefillMs = firstEventAt - respAt;
 					parts.push(`resp ${fmt(respMs)}`, `prefill ${fmt(prefillMs)}${verdict(respMs, prefillMs)}`);
@@ -99,7 +175,7 @@ export default function (pi: ExtensionAPI) {
 			// ---- idle: only the last completed turn ----
 			if (lastTtftMs !== undefined) {
 				parts.push(`TTFT ${fmt(lastTtftMs)}`);
-				if (lastTtftMs >= TTFT_SLOW_MS && lastRespMs !== undefined && lastPrefillMs !== undefined) {
+				if (lastTtftMs >= config.slowMs && lastRespMs !== undefined && lastPrefillMs !== undefined) {
 					parts.push(
 						`resp ${fmt(lastRespMs)}`,
 						`prefill ${fmt(lastPrefillMs)}${verdict(lastRespMs, lastPrefillMs)}`,
@@ -107,7 +183,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 			if (lastTps !== undefined) {
-				parts.push(`${Math.round(lastTps)} tok/s${lastTps < TPS_SLOW ? " ↓" : ""}`);
+				parts.push(`${Math.round(lastTps)} tok/s${lastTps < config.slowTps ? " ↓" : ""}`);
 			}
 		}
 
@@ -219,32 +295,46 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
+		const loaded = readConfig(ctx);
+		config = loaded.config;
+		configNotes = loaded.notes.length > 0 ? loaded.notes : ["defaults"];
 		reset();
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	});
 
 	pi.registerCommand("ttft", {
-		description: "Show or reset pi-ttft statistics",
+		description: "Show pi-ttft statistics and effective config",
 		handler: async (args, ctx) => {
-			if (args.trim() === "reset") {
+			const sub = args.trim().toLowerCase();
+
+			if (sub === "reset") {
 				reset();
 				ctx.ui.setStatus(STATUS_KEY, undefined);
 				ctx.ui.notify("pi-ttft: counters reset", "info");
 				return;
 			}
 
+			if (sub === "reload") {
+				const loaded = readConfig(ctx);
+				config = loaded.config;
+				configNotes = loaded.notes.length > 0 ? loaded.notes : ["defaults"];
+				render(ctx);
+				ctx.ui.notify(`pi-ttft: config reloaded\n${describeConfig(config, configNotes, ctx)}`, "info");
+				return;
+			}
+
 			if (ttfts.length === 0) {
-				ctx.ui.notify("pi-ttft: no data yet, send a message first", "info");
+				ctx.ui.notify(`pi-ttft: no data yet, send a message first\n\n${describeConfig(config, configNotes, ctx)}`, "info");
 				return;
 			}
 
 			const avg = ttfts.reduce((a, b) => a + b, 0) / ttfts.length;
 			const min = Math.min(...ttfts);
 			const max = Math.max(...ttfts);
-			const slow = ttfts.filter((t) => t >= TTFT_SLOW_MS).length;
+			const slow = ttfts.filter((t) => t >= config.slowMs).length;
 
 			const lines = [
-				`TTFT   min ${fmt(min)} / avg ${fmt(avg)} / max ${fmt(max)}   (${ttfts.length} calls${slow > 0 ? `, ${slow} slow` : ""})`,
+				`TTFT   min ${fmt(min)} / avg ${fmt(avg)} / max ${fmt(max)}   (${ttfts.length} calls${slow > 0 ? `, ${slow} over ${fmt(config.slowMs)}` : ""})`,
 			];
 			if (lastRespMs !== undefined && lastPrefillMs !== undefined) {
 				lines.push(`last   resp ${fmt(lastRespMs)} + prefill ${fmt(lastPrefillMs)}`);
@@ -254,9 +344,21 @@ export default function (pi: ExtensionAPI) {
 				`tool   ${fmt(toolMs)} total`,
 				lastTps !== undefined ? `speed  ${Math.round(lastTps)} tok/s last turn` : "",
 				`steps  ${steps}`,
+				"",
+				describeConfig(config, configNotes, ctx),
 			);
 
 			ctx.ui.notify(lines.filter(Boolean).join("\n"), "info");
 		},
 	});
+}
+
+/** Human-readable effective config, showing where each value came from. */
+function describeConfig(config: TtftConfig, notes: string[], ctx: ExtensionContext): string {
+	return [
+		`config slowMs=${config.slowMs}  slowTps=${config.slowTps}  dominantRatio=${config.dominantRatio}`,
+		`       source: ${notes.join(" | ")}`,
+		`       files:  ${configPath("global", ctx.cwd)}`,
+		`               ${configPath("project", ctx.cwd)}`,
+	].join("\n");
 }

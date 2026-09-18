@@ -1,7 +1,7 @@
 # pi-ttft
 
 Time-to-first-token for the [Pi coding agent](https://pi.dev) — a footer HUD that
-stays out of the way until something is actually slow, plus a CLI for benchmarking.
+stays out of the way until something is actually slow.
 
 Pi's built-in status line covers token accounting and context occupancy
 (`↑ input`, `↓ output`, `R cache read`, `CH cache hit %`, `used/capacity`).
@@ -45,12 +45,12 @@ Two details that matter:
 | `tok/s` | decode speed = output tokens / (message_end − first token) |
 
 The `⚠network` / `⚠server` verdict is only printed when one side is at least
-`DOMINANT_RATIO` (default 2×) larger. Otherwise no culprit is named.
+`dominantRatio` (default 2×) larger. Otherwise no culprit is named.
 
 ## Install
 
 ```bash
-pi install git:github.com/quanxinwang18-a11y/pi-ttft@v1.0.1
+pi install git:github.com/quanxinwang18-a11y/pi-ttft@v1.1.0
 ```
 
 Or try it without installing:
@@ -65,17 +65,45 @@ Requires Pi `>= 0.85.1`.
 
 | Command | Effect |
 |---|---|
-| `/ttft` | Full breakdown: TTFT min/avg/max, last-turn resp+prefill split, LLM/tool totals, steps |
+| `/ttft` | Full breakdown: TTFT min/avg/max, last-turn resp+prefill split, LLM/tool totals, steps, effective config |
+| `/ttft reload` | Re-read settings without restarting |
 | `/ttft reset` | Reset counters |
 
 ## Configuration
 
-Thresholds are constants at the top of `extensions/ttft.ts`:
+Thresholds live in your Pi settings, so tuning them does not require editing code:
 
-```ts
-const TTFT_SLOW_MS = 3000;   // at or above this, expand the breakdown
-const TPS_SLOW = 20;         // below this, mark the decode speed
-const DOMINANT_RATIO = 2;    // how dominant one side must be to name a culprit
+```json
+// ~/.pi/agent/settings.json  — global
+// .pi/settings.json          — per project
+{
+  "ttft": {
+    "slowMs": 5000,
+    "slowTps": 20,
+    "dominantRatio": 2
+  }
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `slowMs` | `3000` | TTFT at or above this (ms) expands the `resp` / `prefill` breakdown |
+| `slowTps` | `20` | Decode speed below this (tok/s) gets the `↓` marker |
+| `dominantRatio` | `2` | How many times larger one side must be before a culprit is named |
+
+Every key is optional. **Project settings override global settings key by key**, so
+a repository can raise `slowMs` for a slow provider without touching your global
+config. Invalid values (negative, non-numeric, or a `dominantRatio` below 1) fall
+back to the default.
+
+Changes are picked up on session start, or immediately with `/ttft reload`.
+`/ttft` always prints the effective values and where each came from:
+
+```
+config slowMs=8000  slowTps=35  dominantRatio=2
+       source: global: slowMs=5000, slowTps=35 | project: slowMs=8000
+       files:  /Users/you/.pi/agent/settings.json
+               /Users/you/project/.pi/settings.json
 ```
 
 ### Turning it off
@@ -92,55 +120,6 @@ To do it by hand, add a force-exclude to `~/.pi/agent/settings.json`:
 The path is relative to `~/.pi/agent`. `-path` outranks `+path`, so a project can
 disable a globally-installed extension it does not want.
 
-## CLI
-
-The same measurement from the command line, for comparing models, providers, or
-proxy settings without a human watching a spinner.
-
-```bash
-pi-ttft "explain this repo"
-pi-ttft -n 5 -m anthropic/claude-sonnet-4-5 "hi"
-pi-ttft --json -n 3 "hi" | jq '.summary'
-```
-
-```
-prompt: "用一句话说明什么是 TTFT"
-
-run 2
-  startup        726ms   spawn → turn_start
-  TTFT           3.30s   turn_start → first chunk  ← slow
-  first token    4.08s   turn_start → first visible delta
-  total          5.56s   spawn → message_end
-  decode      121 tok/s   91 output tokens
-
-summary (3 runs)
-  TTFT         min    3.30s / avg    4.12s / max    4.53s
-  first token  min    4.08s / avg    4.55s / max    4.80s
-  total        min    5.56s / avg    6.22s / max    6.63s
-  startup      min    719ms / avg    727ms / max    736ms
-  decode       avg 117 tok/s
-```
-
-| Option | Effect |
-|---|---|
-| `-n, --runs <N>` | Repeat the prompt N times and aggregate |
-| `-m, --model <id>` | Forward `--model` to Pi |
-| `-c, --provider <id>` | Forward `--provider` to Pi |
-| `--timeout <s>` | Per-run timeout (default 180) |
-| `--json` | Machine-readable output |
-
-Two caveats, both intentional:
-
-- The CLI starts its TTFT clock at `turn_start`, while the extension starts at
-  `before_provider_request`. The CLI number is therefore a few milliseconds larger
-  and includes Pi's own pre-request work. The CLI compensates by reporting
-  `startup` separately.
-- Only the **first** assistant turn is timed, so a prompt that triggers tool calls
-  reports the latency of the first model response rather than the whole run.
-
-Decode speed is suppressed below 10 output tokens — a two-token reply can compute
-any rate at all.
-
 ## Design notes
 
 - Timing starts at `before_provider_request`, not `turn_start`, so Pi's own
@@ -150,6 +129,8 @@ any rate at all.
   Those are filtered out so a failure cannot pollute the TTFT average.
 - Concurrent tool calls are summed as a **union of intervals**. Two overlapping
   800ms tools add 800ms, not 1.6s.
+- Settings are read through Pi's own `SettingsManager`, which is what makes
+  project-over-global merging and trust handling behave the same as the rest of Pi.
 
 ## Development
 
@@ -158,15 +139,17 @@ node test/harness.mjs
 ```
 
 The suite drives the extension through a stubbed Pi API with a virtual clock, so
-assertions are exact and it runs instantly without touching a model.
+assertions are exact and it runs instantly without touching a model. A module
+resolution hook (`test/stub-loader.mjs`) redirects the Pi import to
+`test/pi-stub.mjs`, which also lets tests inject arbitrary settings.
 
 ### Packaging note
 
-The core Pi packages are declared as `peerDependencies` (they are bundled by Pi at
-runtime and must not be shipped in the tarball), but they are also marked
-`optional` in `peerDependenciesMeta`. Without that, npm resolves the `*` range and
-installs Pi's entire dependency tree into the package directory — 434 MB for a
-seven-file extension. With it, the install is empty.
+The core Pi packages are declared as `peerDependencies` (Pi bundles them at
+runtime, so they must not ship in the tarball) but are also marked `optional` in
+`peerDependenciesMeta`. Without that, npm resolves the `*` range and installs Pi's
+entire dependency tree into the package directory — 434 MB for a seven-file
+extension. With it, the install is empty.
 
 ## Related packages
 
@@ -193,9 +176,15 @@ Pi 内置状态栏只统计 token 和上下文占用，不报任何延迟。`pi-
 - `prefill` 偏大 → 服务端 prefill 慢，通常意味着 prompt cache 未命中（对照内置
   状态栏的 `CH` 一起看）
 
-状态栏常态只占 20 列，只有在 TTFT 超过 3s、或 decode 低于 20 tok/s 时才展开
-成因拆解并给出结论。`LLM` / `tool` 累计值这类单调递增的数字不在状态栏常驻，
+状态栏常态只占 20 列，只有在 TTFT 越过 `slowMs`、或 decode 低于 `slowTps` 时才
+展开成因拆解并给出结论。`LLM` / `tool` 累计值这类单调递增的数字不在状态栏常驻，
 敲 `/ttft` 查看。
 
-关闭方式：`pi config` 里切换，或在 `~/.pi/agent/settings.json` 加
-`{"extensions": ["-extensions/ttft.ts"]}`。
+三个阈值都在 settings 里配，项目级覆盖全局：
+
+```json
+{ "ttft": { "slowMs": 5000, "slowTps": 20, "dominantRatio": 2 } }
+```
+
+改完 `/ttft reload` 立即生效。关闭方式：`pi config` 里切换，或在
+`~/.pi/agent/settings.json` 加 `{"extensions": ["-extensions/ttft.ts"]}`。

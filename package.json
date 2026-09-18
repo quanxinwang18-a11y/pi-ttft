@@ -1,7 +1,7 @@
 {
   "name": "pi-ttft",
-  "version": "1.0.1",
-  "description": "Time-to-first-token for the Pi coding agent: a footer HUD that stays minimal until something is slow, plus a CLI for benchmarking.",
+  "version": "1.1.0",
+  "description": "Time-to-first-token HUD for the Pi coding agent \u2014 stays minimal until something is slow, then names the cause (network vs server prefill).",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -12,12 +12,8 @@
     "observability",
     "time-to-first-token"
   ],
-  "bin": {
-    "pi-ttft": "./bin/pi-ttft.mjs"
-  },
   "files": [
     "extensions",
-    "bin",
     "README.md",
     "LICENSE"
   ],

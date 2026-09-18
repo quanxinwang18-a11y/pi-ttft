@@ -9,6 +9,13 @@
  */
 
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
+
+// The extension imports the Pi API at runtime; point it at the stub.
+const { resolve: resolveStub } = await import("./stub-loader.mjs");
+registerHooks({ resolve: resolveStub });
+
+const { setStubSettings } = await import("./pi-stub.mjs");
 
 // ---- virtual clock: patch Date.now before the extension reads it ----------
 let vnow = 1_000_000;
@@ -24,6 +31,7 @@ let lastNotify = null;
 let commandHandler = null;
 
 const ctx = {
+	cwd: "/stub/project",
 	ui: {
 		setStatus: (key, text) => statuses.push({ key, text }),
 		notify: (message) => {
@@ -66,7 +74,7 @@ async function test(name, fn) {
 	}
 }
 
-/** Assistant turn helper: keeps each assertion focused on one behaviour. */
+/** Complete one assistant turn with explicit timings. */
 async function turn({ respMs, ttftMs, firstTokenMs, tailMs, outputTokens, stopReason = "stop" }) {
 	await fire("before_provider_request", { payload: {} });
 	if (respMs !== null) {
@@ -88,6 +96,9 @@ async function turn({ respMs, ttftMs, firstTokenMs, tailMs, outputTokens, stopRe
 }
 
 console.log("pi-ttft extension tests\n");
+
+console.log("status line");
+setStubSettings();
 
 await test("session_start clears the status line", async () => {
 	await fire("session_start");
@@ -125,7 +136,6 @@ await test("idle shows TTFT and decode speed", async () => {
 });
 
 await test("slow prefill blames the server", async () => {
-	// headers at 300ms, first chunk at 6.8s → prefill 6.5s dominates
 	await turn({ respMs: 300, ttftMs: 6800, firstTokenMs: 200, tailMs: 2800, outputTokens: 200 });
 	assert.equal(status(), "TTFT 6.8s · resp 300ms · prefill 6.5s ⚠server · 71 tok/s");
 });
@@ -134,7 +144,6 @@ await test("waiting state never mixes in the previous turn's prefill", async () 
 	await fire("before_provider_request", { payload: {} });
 	advance(6500);
 	await fire("after_provider_response", { status: 200, headers: {} });
-	// Previous turn was prefill-heavy, but this request has no prefill yet.
 	assert.equal(status(), "TTFT … · resp 6.5s");
 });
 
@@ -147,22 +156,18 @@ await test("slow network blames the network", async () => {
 await test("no verdict when neither side dominates", async () => {
 	await turn({ respMs: 1600, ttftMs: 4000, firstTokenMs: 200, tailMs: 800, outputTokens: 100 });
 	// resp 1.6s vs prefill 2.4s: 2.4 < 1.6 * 2, so no culprit is named.
-	// decode = 100 / 0.8s = 125 tok/s
 	assert.equal(status(), "TTFT 4.0s · resp 1.6s · prefill 2.4s · 125 tok/s");
 });
 
 await test("slow decode gets a marker", async () => {
 	await turn({ respMs: 200, ttftMs: 1200, firstTokenMs: 100, tailMs: 4000, outputTokens: 60 });
-	// decode = 60 / 4.0s = 15 tok/s
 	assert.equal(status(), "TTFT 1.2s · 15 tok/s ↓");
 });
 
 await test("failed turns are ignored", async () => {
-	const before = status();
 	await fire("before_provider_request", { payload: {} });
 	await fire("message_start", { message: { role: "assistant", stopReason: "error" } });
 	await fire("message_end", { message: { role: "assistant", stopReason: "error" } });
-	// The pending request cleared the display, but no timing was recorded.
 	assert.equal(status(), "TTFT …");
 	await fire("session_start");
 	assert.equal(status(), null);
@@ -172,7 +177,6 @@ await test("recovers to the minimal line after an anomaly", async () => {
 	await turn({ respMs: 300, ttftMs: 6800, firstTokenMs: 200, tailMs: 2800, outputTokens: 200 });
 	assert.match(status(), /⚠server/);
 	await turn({ respMs: 200, ttftMs: 1200, firstTokenMs: 200, tailMs: 2000, outputTokens: 150 });
-	// decode = 150 / 2.0s = 75 tok/s, and the breakdown is gone
 	assert.equal(status(), "TTFT 1.2s · 75 tok/s");
 });
 
@@ -187,10 +191,82 @@ await test("concurrent tools are summed as a union, not twice", async () => {
 	assert.match(lastNotify, /tool {3}800ms total/);
 });
 
-await test("/ttft reports aggregates", async () => {
+console.log("\nconfiguration");
+
+await test("defaults apply when no settings are present", async () => {
+	setStubSettings();
+	await fire("session_start");
 	await commandHandler("", ctx);
-	assert.match(lastNotify, /^TTFT {3}min /);
-	assert.match(lastNotify, /steps {2}\d+/);
+	assert.match(lastNotify, /slowMs=3000 {2}slowTps=20 {2}dominantRatio=2/);
+	assert.match(lastNotify, /source: defaults/);
+});
+
+await test("global settings override defaults", async () => {
+	setStubSettings({ global: { ttft: { slowMs: 5000, slowTps: 35, dominantRatio: 3 } } });
+	await fire("session_start");
+	await commandHandler("", ctx);
+	assert.match(lastNotify, /slowMs=5000 {2}slowTps=35 {2}dominantRatio=3/);
+	assert.match(lastNotify, /source: global: slowMs=5000, slowTps=35, dominantRatio=3/);
+});
+
+await test("project settings win over global, key by key", async () => {
+	setStubSettings({
+		global: { ttft: { slowMs: 5000, slowTps: 35 } },
+		project: { ttft: { slowMs: 8000 } },
+	});
+	await fire("session_start");
+	await commandHandler("", ctx);
+	// slowMs from project, slowTps still from global
+	assert.match(lastNotify, /slowMs=8000 {2}slowTps=35 {2}dominantRatio=2/);
+	assert.match(lastNotify, /global: slowMs=5000, slowTps=35 \| project: slowMs=8000/);
+});
+
+await test("invalid values fall back to the default", async () => {
+	setStubSettings({
+		global: { ttft: { slowMs: -1, slowTps: "fast", dominantRatio: 0.5 } },
+	});
+	await fire("session_start");
+	await commandHandler("", ctx);
+	// negative, non-numeric, and a sub-1 ratio are all rejected
+	assert.match(lastNotify, /slowMs=3000 {2}slowTps=20 {2}dominantRatio=2/);
+	assert.match(lastNotify, /source: defaults/);
+});
+
+await test("slowMs controls when the breakdown expands", async () => {
+	// TTFT 1.4s is unremarkable at the default 3000ms threshold
+	setStubSettings();
+	await fire("session_start");
+	await turn({ respMs: 300, ttftMs: 1400, firstTokenMs: 200, tailMs: 2800, outputTokens: 200 });
+	assert.equal(status(), "TTFT 1.4s · 71 tok/s");
+
+	// ...but expandable once the threshold drops below it
+	setStubSettings({ global: { ttft: { slowMs: 1000 } } });
+	await fire("session_start");
+	await turn({ respMs: 300, ttftMs: 1400, firstTokenMs: 200, tailMs: 2800, outputTokens: 200 });
+	assert.equal(status(), "TTFT 1.4s · resp 300ms · prefill 1.1s ⚠server · 71 tok/s");
+});
+
+await test("slowTps controls the decode marker", async () => {
+	setStubSettings({ global: { ttft: { slowTps: 10 } } });
+	await fire("session_start");
+	// 15 tok/s is slow by default but fine at a 10 threshold
+	await turn({ respMs: 200, ttftMs: 1200, firstTokenMs: 100, tailMs: 4000, outputTokens: 60 });
+	assert.equal(status(), "TTFT 1.2s · 15 tok/s");
+});
+
+await test("dominantRatio controls when a culprit is named", async () => {
+	// resp 1.6s vs prefill 2.4s: a 1.5x gap, invisible at the default ratio of 2
+	setStubSettings({ global: { ttft: { dominantRatio: 1.2 } } });
+	await fire("session_start");
+	await turn({ respMs: 1600, ttftMs: 4000, firstTokenMs: 200, tailMs: 800, outputTokens: 100 });
+	assert.equal(status(), "TTFT 4.0s · resp 1.6s · prefill 2.4s ⚠server · 125 tok/s");
+});
+
+await test("/ttft reload picks up changes without a restart", async () => {
+	setStubSettings({ global: { ttft: { slowMs: 7777 } } });
+	await commandHandler("reload", ctx);
+	assert.match(lastNotify, /slowMs=7777/);
+	assert.match(lastNotify, /config reloaded/);
 });
 
 await test("/ttft reset clears counters", async () => {
@@ -198,7 +274,9 @@ await test("/ttft reset clears counters", async () => {
 	assert.equal(lastNotify, "pi-ttft: counters reset");
 	assert.equal(status(), null);
 	await commandHandler("", ctx);
-	assert.equal(lastNotify, "pi-ttft: no data yet, send a message first");
+	// Config is still reported even with no samples
+	assert.match(lastNotify, /no data yet/);
+	assert.match(lastNotify, /slowMs=7777/);
 });
 
 console.log(`\n${passed} passed${process.exitCode ? ", with failures" : ""}`);
