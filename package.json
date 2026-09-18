@@ -1,6 +1,6 @@
 {
   "name": "pi-ttft",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Time-to-first-token for the Pi coding agent: a footer HUD that stays minimal until something is slow, plus a CLI for benchmarking.",
   "type": "module",
   "license": "MIT",
@@ -28,6 +28,11 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
   },
   "engines": {
     "node": ">=18"

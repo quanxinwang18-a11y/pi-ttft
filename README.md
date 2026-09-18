@@ -50,7 +50,7 @@ The `⚠network` / `⚠server` verdict is only printed when one side is at least
 ## Install
 
 ```bash
-pi install git:github.com/quanxinwang18-a11y/pi-ttft@v1.0.0
+pi install git:github.com/quanxinwang18-a11y/pi-ttft@v1.0.1
 ```
 
 Or try it without installing:
@@ -159,6 +159,14 @@ node test/harness.mjs
 
 The suite drives the extension through a stubbed Pi API with a virtual clock, so
 assertions are exact and it runs instantly without touching a model.
+
+### Packaging note
+
+The core Pi packages are declared as `peerDependencies` (they are bundled by Pi at
+runtime and must not be shipped in the tarball), but they are also marked
+`optional` in `peerDependenciesMeta`. Without that, npm resolves the `*` range and
+installs Pi's entire dependency tree into the package directory — 434 MB for a
+seven-file extension. With it, the install is empty.
 
 ## Related packages
 
